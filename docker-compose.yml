@@ -1,0 +1,36 @@
+services:
+  # 1. O contêiner que roda o seu monitor
+  monitor:
+    build: .
+    container_name: monitor
+    working_dir: /app
+    volumes:
+      - ./monitor.py:/app/monitor.py
+      - ./:/app/
+    networks:
+      - lab-rede
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    privileged: true
+    command: ["python3", "monitor.py", "eth0"]
+
+  # 2. O contêiner "cliente" para gerar tráfego
+  client:
+    build: .
+    container_name: client
+    networks:
+      - lab-rede
+    depends_on:
+      - monitor
+    privileged: true
+    command: ["sleep", "infinity"]
+
+networks:
+  lab-rede:
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.27.0.0/16
+        - subnet: "fd00:0:0:1::/64"
