@@ -231,13 +231,13 @@ def update_text_ui():
     """Limpa a tela e exibe os contadores de pacotes."""
     # Usar 'clear' ou 'cls' pode ser disruptivo. 
     # Vamos apenas imprimir blocos novos.
-    # os.system('clear') 
-    print("\n" + "="*50) 
+    os.system('clear') # <--- MUDANÇA
+    print("="*50) # <--- MUDANÇA
     print(f"--- 🛰️ ATUALIZAÇÃO DO MONITOR @ {get_timestamp()} ---")
     print(f"Monitorando interface: {sys.argv[1]}\n")
     print("Contagem de Pacotes por Protocolo:")
     print("-----------------------------------")
-    
+
     if not PACKET_COUNTERS:
         print("Aguardando pacotes...")
     
