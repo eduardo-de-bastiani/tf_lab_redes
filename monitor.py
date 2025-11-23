@@ -20,6 +20,16 @@ def format_mac(addr_bytes):
     """Formata um endereço MAC de bytes para string."""
     return ":".join(f"{b:02x}" for b in addr_bytes)
 
+def guess_ip_version(packet_bytes):
+    version = (packet_bytes[0] >> 4) & 0xF
+    if version == 4:
+        return 0x0800
+    elif version == 6:
+        return 0x86DD
+    else:
+        return None
+
+
 def format_ipv4(addr_bytes):
     """Formata um endereço IPv4 de bytes para string."""
     return socket.inet_ntoa(addr_bytes)
@@ -468,48 +478,50 @@ def parse_link_layer(packet_bytes, writers):
     except struct.error:
         PACKET_COUNTERS['Link Error'] += 1
 
-
-# --- Função Principal ---
-
 def main():
     if os.geteuid() != 0:
         print("Erro: Este script deve ser executado como root (use sudo).")
-        print("Raw sockets requerem privilégios de administrador.")
         sys.exit(1)
 
     if len(sys.argv) < 2:
-        print("Erro: Forneça o nome da interface de rede.")
-        print(f"Exemplo: sudo {sys.argv[0]} enp4s0")
+        print(f"Uso: sudo {sys.argv[0]} <interface>")
         sys.exit(1)
         
     interface_name = sys.argv[1]
     csv_files, csv_writers = init_csv_files()
 
     try:
-        # AF_PACKET: acesso à camada de enlace (Ethernet raw)
-        # SOCK_RAW: captura pacote completo, sem headers do SO
-        # ntohs(0x0003): ETH_P_ALL = todos os protocolos
-        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
         s.bind((interface_name, 0))
     except socket.error as e:
-        print(f"Erro ao criar socket na interface '{interface_name}': {e}")
-        print("Verifique se o nome da interface está correto (use: ip addr ou ifconfig)")
+        print(f"Erro ao criar socket: {e}")
         sys.exit(1)
-    except PermissionError:
-         print("Erro de Permissão. Tem certeza que executou com 'sudo'?")
-         sys.exit(1)
 
-    print(f"--- 🛰️ Iniciando monitor na interface '{interface_name}' ---")
-    print("Capturando pacotes... Pressione Ctrl+C para parar.")
-    print("Gerando logs: camada_internet.csv, camada_transporte.csv, camada_aplicacao.csv")
+    print(f"--- Monitorando {interface_name} (CTRL+C para sair) ---")
     
     packet_count_since_ui_update = 0
 
     try:
         while True:
             raw_packet, addr = s.recvfrom(65535)
-            parse_link_layer(raw_packet, csv_writers)
+
+            if "tun" in interface_name:
+                simulated_ethertype = guess_ip_version(raw_packet)
+                
+                if simulated_ethertype:
+                    packet_data = {
+                        'mac_dst': '00:00:00:00:00:00',
+                        'mac_src': '00:00:00:00:00:00',
+                        'ethertype': simulated_ethertype,
+                        'payload': raw_packet
+                    }
+                    parse_network_layer(packet_data, csv_writers)
+                else:
+                    PACKET_COUNTERS['Desconhecido (TUN)'] += 1
+            else:
+                parse_link_layer(raw_packet, csv_writers)
             
+
             packet_count_since_ui_update += 1
             if packet_count_since_ui_update >= 1:
                 update_text_ui()
@@ -518,16 +530,12 @@ def main():
                     f.flush()
 
     except KeyboardInterrupt:
-        print("\n--- 🛑 Parando o monitor ---")
-    except Exception as e:
-        print(f"\nErro inesperado: {e}")
+        print("\n--- Monitor encerrado ---")
+        update_text_ui()
     finally:
         s.close()
         for f in csv_files.values():
             f.close()
-        print("Socket e arquivos fechados. Encerrando.")
-        update_text_ui()
-
 
 if __name__ == "__main__":
     main()
