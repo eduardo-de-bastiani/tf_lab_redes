@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import socket
 import struct
 import sys
@@ -10,8 +9,15 @@ from collections import defaultdict
 # Dicionário de contadores para a UI
 PACKET_COUNTERS = defaultdict(int)
 
-# --- Funções Auxiliares de Formatação ---
+# Armazena estatísticas detalhadas de comunicação entre clientes do túnel e máquinas remotas
+CLIENT_STATS = defaultdict(lambda: defaultdict(lambda: {
+    'bytes': 0,
+    'pkts': 0,
+    'ports': set(),
+    'protos': set()
+}))
 
+# Funções auxiliares de formatação
 def get_timestamp():
     """Retorna o timestamp atual formatado."""
     return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -45,12 +51,6 @@ def parse_dns(payload):
     """
     try:
         # Cabeçalho DNS com 12 bytes fixo:
-        # Bytes 0-1: ID (identificador único para a query) (H)
-        # Bytes 2-3: Flags - bit 0x8000 = QR (1=resposta, 0=pergunta) (H)
-        # Bytes 4-5: QDCOUNT (número de questions) (H)
-        # Bytes 6-7: ANCOUNT (número de answers) (H)
-        # Bytes 8-9: NSCOUNT (número de nameservers) (H)
-        # Bytes 10-11: ARCOUNT (número de additional records) (H)
         header = struct.unpack('!HHHHHH', payload[:12])
         flags_word = header[1]
         qdcount = header[2]
@@ -62,12 +62,11 @@ def parse_dns(payload):
         if qdcount == 0:
             return "Pacote DNS (sem query)"
 
-        # 1. Parsear a seção de pergunta
+        # Parsear a seção de pergunta
         offset = 12
         (query_name, offset) = _dns_parse_name(payload, offset)
         
         # Após o nome vem QTYPE (2 bytes) e QCLASS (2 bytes)
-        # QTYPE: 1=A(IPv4), 28=AAAA(IPv6), 5=CNAME, 15=MX, 16=TXT, 12=PTR, 2=NS
         q_header = struct.unpack('!HH', payload[offset:offset+4])
         qtype = q_header[0]
         offset += 4 
@@ -86,18 +85,14 @@ def parse_dns(payload):
         if not is_response:
             return f"Query ({qtype_str}): {query_name}"
 
-        # 2. Parsear seção de resposta se existir
+        # Parsear seção de resposta se existir
         if ancount == 0:
             return f"Resposta para ({qtype_str}) {query_name} (sem respostas)"
 
         # Está no início do primeiro Answer Record
         (answer_name, offset) = _dns_parse_name(payload, offset)
         
-        # Answer Record com 10 bytes:
-        # Bytes 0-1: Type (H) - tipo de record
-        # Bytes 2-3: Class (H) - classe (sempre 1 para IN)
-        # Bytes 4-7: TTL (I) - tempo de vida em segundos
-        # Bytes 8-9: RDLength (H) - tamanho dos dados de resposta
+        # Answer Record com 10 bytes
         ans_header = struct.unpack('!HHIH', payload[offset:offset+10])
         ans_type = ans_header[0]
         ans_rdlength = ans_header[3]
@@ -105,7 +100,7 @@ def parse_dns(payload):
         
         rdata = payload[offset : offset + ans_rdlength]
 
-        # 3. Decodificar os dados da resposta (RDATA) conforme o tipo
+        # Decodificar os dados da resposta (RDATA) conforme o tipo
         if ans_type == 1:
             ip = socket.inet_ntoa(rdata)
             return f"Resposta (A): {answer_name} -> {ip}"
@@ -124,84 +119,80 @@ def parse_dns(payload):
 
     except Exception as e:
         return f"Erro ao parsear DNS: {e}"
-    
+
+
 def _dns_parse_name(payload, offset):
     """
     Decodifica um nome DNS (ex: 'www.google.com').
-    Formato: cada label é prefixado por seu tamanho em 1 byte.
-    Exemplo binário: 3www6google3com0 = www.google.com
-    03 77 77 77 06 67 6f 6f 67 6c 65 03 63 6f 6d 00
-    
-    Retorna (nome_decodificado, novo_offset_apos_nome)
     """
     name_parts = []
     original_offset = offset
     followed_pointer = False
 
     while True:
-        # Byte atual: tamanho da label ou flag de ponteiro
         length = payload[offset]
         
-        # Tamanho 0 = fim do nome (byte terminador)
         if length == 0:
             offset += 1
             break
         
-        # Ponteiro de compressão: padrão 11xxxxxx (0xC0)
-        # Os 14 bits restantes formam um offset para outro lugar no pacote
         if (length & 0xC0) == 0xC0:
-            # Lê 2 bytes: 11xxxxxx (bits altos) + 8 bits (bits baixos)
             pointer_offset = struct.unpack('!H', payload[offset:offset+2])[0]
-            # Máscara para remover os 2 bits de flag e obter o offset real
             pointer_offset &= 0x3FFF
-            
-            # Recursão para ler o nome apontado (não avança offset principal)
             (pointed_name, _) = _dns_parse_name(payload, pointer_offset)
             name_parts.append(pointed_name)
-            
             offset += 2
             followed_pointer = True
             break
         else:
-            # Label normal: byte de tamanho (0-63) seguido pelos caracteres
             offset += 1
             name_parts.append(payload[offset : offset + length].decode('latin-1'))
             offset += length
     
-    # Retorna nome e novo offset (diferente se foi ponteiro)
     if followed_pointer:
         return (".".join(name_parts), original_offset + 2)
     else:
         return (".".join(name_parts), offset)
-    
+
+
 def parse_http(payload):
     """
     Extrai informação de requisição ou resposta HTTP.
     """
     try:
         http_data = payload.decode('latin-1')
-        first_line = http_data.split('\r\n')[0]
+        lines = http_data.split('\r\n')
+        first_line = lines[0]
 
-        # Requisição HTTP: METODO /caminho HTTP/versao
-        # Ex: GET /index.html HTTP/1.1
-        methods = ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH']
-        for method in methods:
-            if first_line.startswith(method):
-                parts = first_line.split(' ')
-                if len(parts) >= 2:
-                    return f"{parts[0]} {parts[1]}"
-        
-        # Resposta HTTP: HTTP/versao codigo mensagem
-        # Ex: HTTP/1.1 200 OK
+        # Busca headers adicionais (Host, User-Agent) para enriquecer o log
+        # Verifica se é um método HTTP ou uma resposta
+        is_http = False
         if first_line.startswith('HTTP/'):
-            return first_line
+            is_http = True
+        else:
+            methods = ['GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'OPTIONS', 'PATCH']
+            for method in methods:
+                if first_line.startswith(method):
+                    is_http = True
+                    break
+        
+        if is_http:
+            extracted_info = [first_line]
+            # Itera sobre as linhas seguintes para encontrar headers relevantes
+            for line in lines[1:]:
+                if not line: break # Linha vazia indica fim dos headers
+                lower_line = line.lower()
+                if lower_line.startswith('host:') or lower_line.startswith('user-agent:'):
+                    extracted_info.append(line.strip())
+            return " | ".join(extracted_info)
 
         return "Fragmento HTTP"
+
     except Exception:
         return "Payload HTTP (binário/malformado)"
 
-# --- Funções de UI e Log ---
 
+# Funções de UI e Log
 def init_csv_files():
     """
     Cria os arquivos CSV e escreve os cabeçalhos se não existirem.
@@ -217,16 +208,11 @@ def init_csv_files():
 
     try:
         for key, (filename, headers) in csv_files.items():
-            # Verifica se o arquivo está vazio para escrever o cabeçalho
             write_header = not os.path.exists(filename) or os.path.getsize(filename) == 0
-            
-            # Abre o arquivo em modo 'append' (a)
             f = open(filename, 'a', newline='', encoding='utf-8')
             writer = csv.writer(f)
-            
             if write_header:
                 writer.writerow(headers)
-            
             files[key] = f
             writers[key] = writer
             
@@ -239,32 +225,48 @@ def init_csv_files():
 
 def update_text_ui():
     """Limpa a tela e exibe os contadores de pacotes."""
-    # Usar 'clear' ou 'cls' pode ser disruptivo. 
-    # Vamos apenas imprimir blocos novos.
-    os.system('clear') # <--- MUDANÇA
-    print("="*50) # <--- MUDANÇA
+    os.system('clear')
+    print("="*60)
     print(f"--- 🛰️ ATUALIZAÇÃO DO MONITOR @ {get_timestamp()} ---")
     print(f"Monitorando interface: {sys.argv[1]}\n")
-    print("Contagem de Pacotes por Protocolo:")
-    print("-----------------------------------")
-
+    
+    print("Contagem Global de Pacotes:")
+    print("-" * 30)
     if not PACKET_COUNTERS:
         print("Aguardando pacotes...")
     
-    # Ordena os contadores por contagem (maior primeiro)
     sorted_counters = sorted(
         PACKET_COUNTERS.items(), 
         key=lambda item: item[1], 
         reverse=True
     )
-    
     for proto, count in sorted_counters:
-        print(f"| {proto:<10}: {count:>10}")
+        print(f"| {proto:<15}: {count:>8}")
         
-    print("-----------------------------------")
-    print("\nPressione Ctrl+C para parar.")
-    print("-----------------------------------")
-    print("="*50 + "\n")
+    # Exibição detalhada por cliente
+    print("\n" + "="*60)
+    print("DETALHES DOS CLIENTES (Rede Túnel 172.31.66.x)")
+    print("="*60)
+    
+    if not CLIENT_STATS:
+        print("Nenhum tráfego de cliente detectado ainda.")
+    
+    for client_ip, remotes in CLIENT_STATS.items():
+        # Calcula total de tráfego do cliente somando todos os remotos
+        total_bytes = sum(stats['bytes'] for stats in remotes.values())
+        print(f"\n🟢 CLIENTE: {client_ip} | Total Tráfego: {total_bytes/1024:.2f} KB")
+        print(f"   {'Máquina Remota':<20} | {'Proto':<10} | {'Pkts':<5} | {'Vol(B)':<8} | {'Portas'}")
+        print("   " + "-"*55)
+        
+        for remote_ip, stats in remotes.items():
+            # Formata listas de protocolos e portas para caber na linha
+            protos_str = ",".join(list(stats['protos'])[:3])
+            ports_str = ",".join(map(str, list(stats['ports'])[:5]))
+            
+            print(f"   -> {remote_ip:<17} | {protos_str:<10} | {stats['pkts']:<5} | {stats['bytes']:<8} | {ports_str}")
+
+    print("\n" + "="*60)
+    print("Pressione Ctrl+C para parar.")
 
 
 def get_app_protocol(src_port, dst_port):
@@ -282,8 +284,8 @@ def get_app_protocol(src_port, dst_port):
         return 'HTTPS'
     return 'Outro'
 
-# --- Funções Principais de Parsing ---
 
+# Funções principais de parsing
 def parse_application_layer(payload, ip_src, ip_dst, size, protocol_name, writers):
     """
     Loga protocolos da camada de aplicação.
@@ -312,56 +314,64 @@ def parse_transport_layer(payload, ip_src, ip_dst, size, protocol_id, writers):
     timestamp = get_timestamp()
     
     try:
+        app_proto = 'Outro'
+        l7_payload = b''
+        src_port = 0
+        dst_port = 0
+        proto_name = ''
+
         # Protocolo 6 = TCP
         if protocol_id == 6:
             PACKET_COUNTERS['TCP'] += 1
-            # Cabeçalho TCP com 20 bytes mínimo:
-            # Bytes 0-1: Porta origem (H)
-            # Bytes 2-3: Porta destino (H)
-            # Bytes 4-7: Número sequência (L)
-            # Bytes 8-11: Número confirmação (L)
-            # Bytes 12-13: Data Offset (4 bits) + Flags (12 bits) (H)
-            # Bytes 14-15: Window size (H)
-            # Bytes 16-17: Checksum (H)
-            # Bytes 18-19: Urgent pointer (H)
+            proto_name = 'TCP'
             header = struct.unpack('!HHLLHHHH', payload[:20])
             src_port = header[0]
             dst_port = header[1]
             
-            # Data Offset está nos 4 bits superiores do campo offset_flags
-            # Valor em palavras de 32 bits, multiplicar por 4 para bytes
             offset_flags = header[4]
             tcp_header_len = ((offset_flags >> 12) & 0xF) * 4
             l7_payload = payload[tcp_header_len:]
 
-            log_data = [timestamp, 'TCP', ip_src, src_port, ip_dst, dst_port, size]
-            writers['trans'].writerow(log_data)
-            
-            app_proto = get_app_protocol(src_port, dst_port)
-            parse_application_layer(l7_payload, ip_src, ip_dst, size, app_proto, writers)
-
         # Protocolo 17 = UDP
         elif protocol_id == 17:
             PACKET_COUNTERS['UDP'] += 1
-            # Cabeçalho UDP com 8 bytes fixo:
-            # Bytes 0-1: Porta origem (H)
-            # Bytes 2-3: Porta destino (H)
-            # Bytes 4-5: Tamanho total (H)
-            # Bytes 6-7: Checksum (H)
+            proto_name = 'UDP'
             header = struct.unpack('!HHHH', payload[:8])
             src_port = header[0]
             dst_port = header[1]
             
             l7_payload = payload[8:]
             
-            log_data = [timestamp, 'UDP', ip_src, src_port, ip_dst, dst_port, size]
+        if proto_name:
+            log_data = [timestamp, proto_name, ip_src, src_port, ip_dst, dst_port, size]
             writers['trans'].writerow(log_data)
 
             app_proto = get_app_protocol(src_port, dst_port)
+
+            # Atualiza as estatísticas na memória para a UI
+            # Verifica se a origem é um cliente da rede túnel (Upload/Request)
+            if ip_src.startswith("172.31.66."):
+                client = ip_src
+                remote = ip_dst
+                stats = CLIENT_STATS[client][remote]
+                stats['bytes'] += size
+                stats['pkts'] += 1
+                stats['ports'].add(dst_port)
+                stats['protos'].add(app_proto)
+            
+            # Verifica se o destino é um cliente da rede túnel (Download/Response)
+            elif ip_dst.startswith("172.31.66."):
+                client = ip_dst
+                remote = ip_src
+                stats = CLIENT_STATS[client][remote]
+                stats['bytes'] += size
+                stats['pkts'] += 1
+                stats['ports'].add(src_port)
+                stats['protos'].add(app_proto)
+
             parse_application_layer(l7_payload, ip_src, ip_dst, size, app_proto, writers)
             
     except struct.error:
-        # Pacote malformado ou muito pequeno
         PACKET_COUNTERS['Transport Error'] += 1
 
 def parse_network_layer(packet_data, writers):
@@ -376,18 +386,6 @@ def parse_network_layer(packet_data, writers):
         
         try:
             header_data = packet_data['payload'][:20]
-            
-            # Cabeçalho IPv4 com 20 bytes mínimo:
-            # Byte 0: Versão (4 bits) + IHL (4 bits) (B)
-            # Byte 1: Type of Service (B)
-            # Bytes 2-3: Tamanho total (H)
-            # Bytes 4-5: Identificação (H)
-            # Bytes 6-7: Flags (3 bits) + Fragment Offset (13 bits) (H)
-            # Byte 8: Time to Live (B)
-            # Byte 9: Protocolo (TCP=6, UDP=17, ICMP=1) (B)
-            # Bytes 10-11: Header checksum (H)
-            # Bytes 12-15: IP origem (4s)
-            # Bytes 16-19: IP destino (4s)
             header = struct.unpack('!BBHHHBBH4s4s', header_data)
             
             version_ihl = header[0]
@@ -402,11 +400,21 @@ def parse_network_layer(packet_data, writers):
             log_data = [timestamp, 'IPv4', ip_src, ip_dst, protocol_id, total_size]
             writers['net'].writerow(log_data)
             
-            # ICMP (protocolo 1): não encapsula protocolos superiores
             if protocol_id == 1:
                 PACKET_COUNTERS['ICMP'] += 1
                 log_data_icmp = [timestamp, 'ICMP', ip_src, ip_dst, '', total_size]
                 writers['net'].writerow(log_data_icmp)
+
+                # Adicionando suporte básico para ICMP nas stats de cliente para completude:
+                if ip_src.startswith("172.31.66."):
+                    CLIENT_STATS[ip_src][ip_dst]['bytes'] += total_size
+                    CLIENT_STATS[ip_src][ip_dst]['pkts'] += 1
+                    CLIENT_STATS[ip_src][ip_dst]['protos'].add("ICMP")
+                elif ip_dst.startswith("172.31.66."):
+                    CLIENT_STATS[ip_dst][ip_src]['bytes'] += total_size
+                    CLIENT_STATS[ip_dst][ip_src]['pkts'] += 1
+                    CLIENT_STATS[ip_dst][ip_src]['protos'].add("ICMP")
+
             else:
                 parse_transport_layer(ip_payload, ip_src, ip_dst, total_size, protocol_id, writers)
 
@@ -419,14 +427,6 @@ def parse_network_layer(packet_data, writers):
         
         try:
             header_data = packet_data['payload'][:40]
-            
-            # Cabeçalho IPv6 com 40 bytes fixo:
-            # Bytes 0-3: Versão (4 bits) + Traffic Class (8 bits) + Flow Label (20 bits) (L)
-            # Bytes 4-5: Payload Length (H)
-            # Byte 6: Next Header (protocolo) (B)
-            # Byte 7: Hop Limit (B)
-            # Bytes 8-23: IP origem (16 bytes)
-            # Bytes 24-39: IP destino (16 bytes)
             payload_size = struct.unpack('!H', header_data[4:6])[0]
             protocol_id = header_data[6]
             ip_src = format_ipv6(header_data[8:24])
@@ -439,7 +439,6 @@ def parse_network_layer(packet_data, writers):
             
             ip_payload = packet_data['payload'][40:]
             
-            # ICMPv6 (Next Header 58): não encapsula protocolos superiores
             if protocol_id == 58:
                 PACKET_COUNTERS['ICMPV6'] += 1
                 log_data_icmp = [timestamp, 'ICMPV6', ip_src, ip_dst, '', total_size]
@@ -460,10 +459,6 @@ def parse_link_layer(packet_bytes, writers):
     Extrai frame Ethernet e passa para camada de rede.
     """
     try:
-        # Cabeçalho Ethernet com 14 bytes fixo:
-        # Bytes 0-5: MAC destino (6s)
-        # Bytes 6-11: MAC origem (6s)
-        # Bytes 12-13: EtherType (H) - 0x0800=IPv4, 0x86DD=IPv6, 0x0806=ARP
         header = struct.unpack('!6s6sH', packet_bytes[:14])
         
         packet_data = {
